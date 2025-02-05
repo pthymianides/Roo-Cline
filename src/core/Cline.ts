@@ -78,7 +78,9 @@ export class Cline {
 	private lastMessageTs?: number
 	private consecutiveMistakeCount: number = 0
 	private consecutiveMistakeCountForApplyDiff: Map<string, number> = new Map()
+		private actionHistory: { type: string; success: boolean; error?: string; timestamp: number }[] = [];
 	private providerRef: WeakRef<ClineProvider>
+  private currentReward: number = 0;
 	private abort: boolean = false
 	didFinishAborting = false
 	abandoned = false
@@ -157,8 +159,7 @@ export class Cline {
 
 	private async getSavedApiConversationHistory(): Promise<Anthropic.MessageParam[]> {
 		const filePath = path.join(await this.ensureTaskDirectoryExists(), GlobalFileNames.apiConversationHistory)
-		const fileExists = await fileExistsAtPath(filePath)
-		if (fileExists) {
+		if (await fileExistsAtPath(filePath)) {
 			return JSON.parse(await fs.readFile(filePath, "utf8"))
 		}
 		return []
@@ -448,7 +449,7 @@ export class Cline {
 		const lastApiReqStartedIndex = findLastIndex(
 			modifiedClineMessages,
 			(m) => m.type === "say" && m.say === "api_req_started",
-		)
+			)
 		if (lastApiReqStartedIndex !== -1) {
 			const lastApiReqStarted = modifiedClineMessages[lastApiReqStartedIndex]
 			const { cost, cancelReason }: ClineApiReqInfo = JSON.parse(lastApiReqStarted.text || "{}")
@@ -538,18 +539,20 @@ export class Cline {
 		// (note this isn't relevant anymore since we use custom tool prompts instead of tool use blocks, but this is here for legacy purposes in case users resume old tasks)
 
 		// if the last message is a user message, we can need to get the assistant message before it to see if it made tool calls, and if so, fill in the remaining tool responses with 'interrupted'
-
+		
+		// if the last message is a user message, we can need to get the assistant message before it to see if it made tool calls, and if so, fill in the remaining tool responses with 'interrupted'
+		
 		let modifiedOldUserContent: UserContent // either the last message if its user message, or the user message before the last (assistant) message
 		let modifiedApiConversationHistory: Anthropic.Messages.MessageParam[] // need to remove the last user message to replace with new modified user message
 		if (existingApiConversationHistory.length > 0) {
 			const lastMessage = existingApiConversationHistory[existingApiConversationHistory.length - 1]
-
+		
 			if (lastMessage.role === "assistant") {
 				const content = Array.isArray(lastMessage.content)
 					? lastMessage.content
 					: [{ type: "text", text: lastMessage.content }]
 				const hasToolUse = content.some((block) => block.type === "tool_use")
-
+		
 				if (hasToolUse) {
 					const toolUseBlocks = content.filter(
 						(block) => block.type === "tool_use",
@@ -568,7 +571,7 @@ export class Cline {
 			} else if (lastMessage.role === "user") {
 				const previousAssistantMessage: Anthropic.Messages.MessageParam | undefined =
 					existingApiConversationHistory[existingApiConversationHistory.length - 2]
-
+		
 				const existingUserContent: UserContent = Array.isArray(lastMessage.content)
 					? lastMessage.content
 					: [{ type: "text", text: lastMessage.content }]
@@ -576,16 +579,16 @@ export class Cline {
 					const assistantContent = Array.isArray(previousAssistantMessage.content)
 							? previousAssistantMessage.content
 							: [{ type: "text", text: previousAssistantMessage.content }]
-
+		
 					const toolUseBlocks = assistantContent.filter(
 						(block) => block.type === "tool_use",
 					) as Anthropic.Messages.ToolUseBlock[]
-
+		
 					if (toolUseBlocks.length > 0) {
 						const existingToolResults = existingUserContent.filter(
 							(block) => block.type === "tool_result",
 						) as Anthropic.ToolResultBlockParam[]
-
+		
 						const missingToolResponses: Anthropic.ToolResultBlockParam[] = toolUseBlocks
 							.filter(
 								(toolUse) => !existingToolResults.some((result) => result.tool_use_id === toolUse.id),
@@ -595,7 +598,7 @@ export class Cline {
 								tool_use_id: toolUse.id,
 								content: "Task was interrupted before this tool call could be completed.",
 							}))
-
+		
 						modifiedApiConversationHistory = existingApiConversationHistory.slice(0, -1) // removes the last user message
 						modifiedOldUserContent = [...existingUserContent, ...missingToolResponses]
 					} else {
@@ -612,9 +615,9 @@ export class Cline {
 		} else {
 			throw new Error("Unexpected: No existing API conversation history")
 		}
-
+		
 		let newUserContent: UserContent = [...modifiedOldUserContent]
-
+		
 		const agoText = (() => {
 			const timestamp = lastClineMessage?.ts ?? Date.now()
 			const now = Date.now()
@@ -622,7 +625,7 @@ export class Cline {
 			const minutes = Math.floor(diff / 60000)
 			const hours = Math.floor(minutes / 60)
 			const days = Math.floor(hours / 24)
-
+		
 			if (days > 0) {
 				return `${days} day${days > 1 ? "s" : ""} ago`
 			}
@@ -634,9 +637,9 @@ export class Cline {
 			}
 			return "just now"
 		})()
-
+		
 		const wasRecent = lastClineMessage?.ts && Date.now() - lastClineMessage.ts < 30_000
-
+		
 		newUserContent.push({
 			type: "text",
 			text:
@@ -644,30 +647,31 @@ export class Cline {
 					wasRecent
 						? "\n\nIMPORTANT: If the last tool use was a write_to_file that was interrupted, the file was reverted back to its original state before the interrupted edit, and you do NOT need to re-read the file as you already have its up-to-date contents."
 						: ""
+						: ""
 				}` +
 				(responseText
 					? `\n\nNew instructions for task continuation:\n<user_message>\n${responseText}\n</user_message>`
 					: ""),
 		})
-
+		
 		if (responseImages && responseImages.length > 0) {
 			newUserContent.push(...formatResponse.imageBlocks(responseImages))
 		}
-
+		
 		await this.overwriteApiConversationHistory(modifiedApiConversationHistory)
 		await this.initiateTaskLoop(newUserContent)
 	}
-
+	
 	private async initiateTaskLoop(userContent: UserContent): Promise<void> {
 		let nextUserContent = userContent
 		let includeFileDetails = true
 		while (!this.abort) {
 			const didEndLoop = await this.recursivelyMakeClineRequests(nextUserContent, includeFileDetails)
 			includeFileDetails = false // we only need file details the first time
-
+		
 			//  The way this agentic loop works is that cline will be given a task that he then calls tools to complete. unless there's an attempt_completion call, we keep responding back to him with his tool's responses until he either attempt_completion or does not use anymore tools. If he does not use anymore tools, we ask him to consider if he's completed the task and then call attempt_completion, otherwise proceed with completing the task.
 			// There is a MAX_REQUESTS_PER_TASK limit to prevent infinite requests, but Cline is prompted to finish the task as efficiently as he can.
-
+		
 			//const totalCost = this.calculateApiCost(totalInputTokens, totalOutputTokens)
 			if (didEndLoop) {
 				// For now a task never 'completes'. This will only happen if the user hits max requests and denies resetting the count.
@@ -676,8 +680,6 @@ export class Cline {
 			} else {
 				// this.say(
 				// 	"tool",
-				// 	"Cline responded with only text blocks but has not called attempt_completion yet. Forcing him to continue with task..."
-				// )
 				nextUserContent = [
 					{
 						type: "text",
@@ -696,7 +698,33 @@ export class Cline {
 		this.browserSession.closeBrowser()
 	}
 
+	 private updateReward(success: boolean) {
+	   this.currentReward += success ? 1 : -1;
+	 }
 	// Tools
+
+	private async logAction(type: string, success: boolean, error?: string) {
+		this.actionHistory.push({ type, success, error, timestamp: Date.now() });
+	   const mcpHub = this.providerRef.deref()?.mcpHub;
+	   if (mcpHub) {
+	     try {
+	       await mcpHub.callTool("mcp-knowledge-graph", "create_entities", {
+	         entities: [
+	           {
+	             name: `${type}-${Date.now()}`,
+	             entityType: type,
+	             observations: [
+	               `Success: ${success}`,
+	               error ? `Error: ${error}` : "",
+	             ].filter(Boolean),
+	           },
+	         ],
+	       });
+	     } catch (e) {
+	       console.error("Failed to log action to knowledge graph:", e);
+	     }
+	   }
+	}
 
 	async executeCommandTool(command: string): Promise<[boolean, ToolResponse]> {
 		const terminalInfo = await this.terminalManager.getOrCreateTerminal(cwd)
@@ -773,6 +801,7 @@ export class Cline {
 				}\n\nYou will be updated on the terminal status and new output in the future.`,
 			]
 		}
+		this.logAction("execute_command", completed, result);
 	}
 
 	async *attemptApiRequest(previousApiReqIndex: number): ApiStream {
@@ -833,6 +862,7 @@ export class Cline {
 		// (needs to be placed outside of try/catch since it we want caller to handle errors not with api_req_failed as that is reserved for first chunk failures only)
 		// this delegates to another generator or iterable object. In this case, it's saying "yield all remaining values from this iterator". This effectively passes along all subsequent chunks from the original stream.
 		yield* iterator
+		this.logAction("api_request", true);
 	}
 
 	async presentAssistantMessage() {
@@ -1054,6 +1084,7 @@ export class Cline {
 					await this.browserSession.closeBrowser()
 				}
 
+				this.logAction(`tool_use_${block.name}`, true);
 				switch (block.name) {
 					case "write_to_file": {
 						const relPath: string | undefined = block.params.path
@@ -1225,6 +1256,7 @@ export class Cline {
 							await this.diffViewProvider.reset()
 							break
 						}
+						this.logAction("tool_use_write_to_file", true);
 					}
 					case "apply_diff": {
 						const relPath: string | undefined = block.params.path
@@ -1341,6 +1373,7 @@ export class Cline {
 							await this.diffViewProvider.reset()
 							break
 						}
+						this.logAction("tool_use_apply_diff", true);
 					}
 					case "read_file": {
 						const relPath: string | undefined = block.params.path
@@ -1381,6 +1414,7 @@ export class Cline {
 							await handleError("reading file", error)
 							break
 						}
+						this.logAction("tool_use_read_file", true);
 					}
 					case "list_files": {
 						const relDirPath: string | undefined = block.params.path
@@ -1423,6 +1457,7 @@ export class Cline {
 							await handleError("listing files", error)
 							break
 						}
+						this.logAction("tool_use_list_files", true);
 					}
 					case "list_code_definition_names": {
 						const relDirPath: string | undefined = block.params.path
@@ -1464,6 +1499,7 @@ export class Cline {
 							await handleError("parsing source code definitions", error)
 							break
 						}
+						this.logAction("tool_use_list_code_definition_names", true);
 					}
 					case "search_files": {
 						const relDirPath: string | undefined = block.params.path
@@ -1512,6 +1548,7 @@ export class Cline {
 							await handleError("searching files", error)
 							break
 						}
+						this.logAction("tool_use_search_files", true);
 					}
 					case "browser_action": {
 						const action: BrowserAction | undefined = block.params.action as BrowserAction
@@ -1658,6 +1695,7 @@ export class Cline {
 							await handleError("executing browser action", error)
 							break
 						}
+						this.logAction("tool_use_browser_action", true);
 					}
 					case "execute_command": {
 						const command: string | undefined = block.params.command
@@ -1692,6 +1730,7 @@ export class Cline {
 							await handleError("executing command", error)
 							break
 						}
+						this.logAction("tool_use_execute_command", true);
 					}
 					case "use_mcp_tool": {
 						const server_name: string | undefined = block.params.server_name
@@ -1787,6 +1826,7 @@ export class Cline {
 							await handleError("executing MCP tool", error)
 							break
 						}
+						this.logAction("tool_use_use_mcp_tool", true);
 					}
 					case "access_mcp_resource": {
 						const server_name: string | undefined = block.params.server_name
@@ -1848,6 +1888,7 @@ export class Cline {
 							await handleError("accessing MCP resource", error)
 							break
 						}
+						this.logAction("tool_use_access_mcp_resource", true);
 					}
 					case "ask_followup_question": {
 						const question: string | undefined = block.params.question
@@ -1875,6 +1916,7 @@ export class Cline {
 							await handleError("asking question", error)
 							break
 						}
+						this.logAction("tool_use_ask_followup_question", true);
 					}
 					case "attempt_completion": {
 						/*
@@ -2006,6 +2048,7 @@ export class Cline {
 							await handleError("inspecting site", error)
 							break
 						}
+						this.logAction("tool_use_attempt_completion", true);
 					}
 				}
 				break
